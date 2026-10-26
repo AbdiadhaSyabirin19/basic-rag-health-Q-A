@@ -1,0 +1,12 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.gitignore
+qdrant_storage/
+logs/
+evaluasi/
+*.xlsx
+*.csv
+.env

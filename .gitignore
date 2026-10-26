@@ -1,0 +1,34 @@
+# Virtual Environment (Modul Python Lokal)
+venv/
+.venv/
+env/
+ENV/
+
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Environment variables (Sangat penting agar tidak membocorkan API key/config privat)
+.env
+
+# File Data Besar & Dokumen Lokal (Folder data)
+data/
+*.csv
+*.xlsx
+
+# Folder database vektor lokal Qdrant
+qdrant_storage/
+
+# Fine-tuning & model training
+finetuning/
+
+# Log files
+logs/
+*.log
+
+# Hasil Evaluasi
+hasil evaluasi/
