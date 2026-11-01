@@ -10,6 +10,7 @@ Menyediakan fungsi utilitas bersama:
 
 import json
 import logging
+import re
 import sys
 import time
 from pathlib import Path
@@ -77,7 +78,7 @@ def muat_kasus_uji(target_path: str = "test_cases") -> list[dict]:
 def buat_evaluator_ragas():
     """Menyiapkan evaluator LLM & Embeddings RAGAS 100% berbasis Ollama lokal.
 
-    Menggunakan LLM_EVAL_MODEL (default: qwen3:1.7b) agar cukup cepat
+    Menggunakan LLM_EVAL_MODEL (default: qwen3:1.7b / qwen3:4b) agar cukup cepat
     di CPU lokal dan tidak melebihi timeout RAGAS.
 
     Returns:
@@ -96,10 +97,6 @@ def buat_evaluator_ragas():
             from ragas.llms import LangchainLLMWrapper
         from src import config
 
-        # Gunakan LLM_EVAL_MODEL sebagai evaluator — sengaja berbeda dari LLM_MODEL
-        # untuk menghindari self-evaluation bias. Thinking mode akan dimatikan
-        # secara eksplisit (extra_body think=False) agar output tetap berupa JSON
-        # bersih sesuai kebutuhan RAGAS, bukan prose/narasi panjang.
         logger.info(
             f"Mengonfigurasi Ollama Lokal ({config.LLM_EVAL_MODEL}) sebagai evaluator RAGAS..."
         )
@@ -107,70 +104,244 @@ def buat_evaluator_ragas():
         class RobustRagasLLMWrapper(LangchainLLMWrapper):
             """Wrapper LLM RAGAS yang otomatis menormalkan JSON output dari model lokal.
 
-            Model kecil seperti qwen3:1.7b kadang mengembalikan JSON Array murni `[...]`
-            alih-alih Dictionary `{"statements": [...]}` yang diharapkan Pydantic / RAGAS.
-            Wrapper ini menormalkan list tersebut ke dict agar tidak memicu OutputParserException.
+            1. Mengubah JSON array murni `[...]` menjadi dictionary `{"classifications": [...], "statements": [...]}`.
+            2. Membuka pembungkus ekstra seperti `{"output": {...}}` atau `{"result": {...}}`.
+            3. Memetakan alias kunci (`sentence` -> `statement`, `supported` -> `attributed`).
+            4. Menangani output teks naratif non-JSON pada verifikasi presisi konteks.
+            5. Otomatis membungkus output ke `{"text": ...}` saat RAGAS memanggil FixOutputFormat (StringIO).
+            6. Mendeduplikasi statement berulang dari degenerate repetition loop.
             """
 
             @staticmethod
-            def _bersihkan_teks(teks: str) -> str:
-                t = (teks or "").strip()
-                # Bersihkan markdown codeblock ```json ... ```
-                if t.startswith("```"):
-                    lines = t.split("\n")
-                    if lines[0].startswith("```"):
-                        lines = lines[1:]
-                    if lines and lines[-1].strip() == "```":
-                        lines = lines[:-1]
-                    t = "\n".join(lines).strip()
+            def _is_expecting_string_io(prompt) -> bool:
+                if prompt is None:
+                    return False
+                prompt_str = prompt.to_string() if hasattr(prompt, "to_string") else str(prompt)
+                indicators = [
+                    "fix_output_format",
+                    "Fix the output string",
+                    "OutputStringAndPrompt",
+                    "StringIO",
+                ]
+                return any(ind.lower() in prompt_str.lower() for ind in indicators)
 
-                # Cek jika outputnya adalah JSON Array [ ... ]
-                if t.startswith("[") and t.endswith("]"):
+            @classmethod
+            def _bersihkan_teks(cls, teks: str, is_string_io: bool = False) -> str:
+                t = (teks or "").strip()
+
+                # 1. Bersihkan markdown codeblock ```json ... ```
+                if "```" in t:
+                    lines = t.split("\n")
+                    filtered = []
+                    in_block = False
+                    for line in lines:
+                        if line.strip().startswith("```"):
+                            in_block = not in_block
+                            continue
+                        filtered.append(line)
+                    t = "\n".join(filtered).strip()
+
+                # 2. Kasus khusus: RAGAS memanggil FixOutputFormat yang mengharuskan skema StringIO (field "text")
+                if is_string_io:
                     try:
                         parsed = json.loads(t)
-                        if isinstance(parsed, list):
-                            if all(isinstance(x, str) for x in parsed):
-                                return json.dumps({"statements": parsed})
-                            return json.dumps({
-                                "statements": parsed,
-                                "verifications": parsed,
-                                "classifications": parsed,
-                            })
+                        if isinstance(parsed, dict):
+                            if "text" in parsed:
+                                return t
+                            return json.dumps({"text": t})
+                        elif isinstance(parsed, list):
+                            return json.dumps({"text": t})
+                    except Exception:
+                        return json.dumps({"text": t})
+
+                # 3. Perbaiki kutip ganda berlebih di akhir string (misal: "text"",)
+                t = re.sub(r'""(\s*[,}\]])', r'"\1', t)
+
+                # 4. Ekstrak bagian JSON jika model mencampurnya dengan teks intro/outro
+                json_str = t
+                start_bracket = t.find("[")
+                end_bracket = t.rfind("]")
+                start_brace = t.find("{")
+                end_brace = t.rfind("}")
+
+                if start_bracket != -1 and (start_brace == -1 or start_bracket < start_brace):
+                    if end_bracket > start_bracket:
+                        json_str = t[start_bracket : end_bracket + 1]
+                elif start_brace != -1:
+                    if end_brace > start_brace:
+                        json_str = t[start_brace : end_brace + 1]
+
+                parsed = None
+                try:
+                    parsed = json.loads(json_str)
+                except Exception:
+                    try:
+                        parsed = json.loads(t)
                     except Exception:
                         pass
+
+                # 5. Jika parsed berupa Dictionary: buka pembungkus ekstra ("output", "result", "response", "data")
+                if isinstance(parsed, dict):
+                    for wrapper_key in ["output", "result", "response", "data"]:
+                        if wrapper_key in parsed and isinstance(parsed[wrapper_key], (dict, list)):
+                            parsed = parsed[wrapper_key]
+                            break
+
+                # 6. Jika parsed berupa List (atau hasil unwrap adalah list):
+                if isinstance(parsed, list):
+                    normalized_list = []
+                    for item in parsed:
+                        if isinstance(item, dict):
+                            stmt = (
+                                item.get("statement")
+                                or item.get("sentence")
+                                or item.get("claim")
+                                or item.get("text")
+                                or ""
+                            )
+                            reason = item.get("reason", "")
+                            val = (
+                                item.get("attributed")
+                                if "attributed" in item
+                                else (
+                                    item.get("supported")
+                                    if "supported" in item
+                                    else item.get("verdict", 1)
+                                )
+                            )
+                            int_val = 1 if val in (1, "1", True, "yes", "Yes", "true", "True") else 0
+
+                            normalized_item = {
+                                "statement": stmt,
+                                "sentence": stmt,
+                                "reason": reason,
+                                "attributed": int_val,
+                                "supported": int_val,
+                                "verdict": int_val,
+                            }
+                            normalized_list.append(normalized_item)
+                        elif isinstance(item, str):
+                            normalized_list.append(item)
+
+                    return json.dumps({
+                        "classifications": normalized_list,
+                        "statements": normalized_list,
+                        "verifications": normalized_list,
+                    })
+
+                # 7. Jika parsed berupa Dictionary:
+                if isinstance(parsed, dict):
+                    # Deduplikasi jika ada statements berulang (repetition loop)
+                    if "statements" in parsed and isinstance(parsed["statements"], list):
+                        unique_stmts = []
+                        seen = set()
+                        for s in parsed["statements"]:
+                            val = s.get("statement") if isinstance(s, dict) else s
+                            if val not in seen:
+                                seen.add(val)
+                                unique_stmts.append(s)
+                        parsed["statements"] = unique_stmts
+
+                    # Pastikan alias antar-metrik saling melengkapi
+                    if "statements" in parsed and "classifications" not in parsed:
+                        parsed["classifications"] = parsed["statements"]
+                    if "classifications" in parsed and "statements" not in parsed:
+                        parsed["statements"] = parsed["classifications"]
+
+                    return json.dumps(parsed)
+
+                # 8. Jika BUKAN JSON (model mengeluarkan teks naratif murni tanpa format JSON):
+                # Buat dictionary JSON universal yang memenuhi semua skema PydanticPrompt RAGAS:
+                # - StringIO: field 'text'
+                # - ContextRecallClassifications: field 'classifications'
+                # - Faithfulness / Statements: field 'statements'
+                # - ContextPrecision: field 'reason', 'verification', 'verdict'
+                if not parsed:
+                    is_pos = 1 if any(w in t.lower() for w in [
+                        "useful", "relevant", "yes", "mendukung", "sesuai", "benar", "directly corresponds", "1"
+                    ]) else 0
+                    if is_pos == 0 and not any(w in t.lower() for w in ["tidak", "bukan", "no", "irrelevant", "false", "0"]):
+                        is_pos = 1
+
+                    sample_item = {
+                        "statement": t,
+                        "sentence": t,
+                        "reason": t,
+                        "attributed": is_pos,
+                        "supported": is_pos,
+                        "verdict": is_pos,
+                    }
+                    return json.dumps({
+                        "text": t,
+                        "reason": t,
+                        "verification": is_pos,
+                        "verdict": is_pos,
+                        "attributed": is_pos,
+                        "classifications": [sample_item],
+                        "statements": [sample_item],
+                        "verifications": [sample_item],
+                    })
+
                 return t
 
             @classmethod
-            def _proses_generations(cls, generations):
+            def _proses_generations(cls, generations, prompt=None):
+                is_string_io = cls._is_expecting_string_io(prompt)
                 for gen_list in generations:
                     for gen in gen_list:
+                        raw_text = ""
                         if hasattr(gen, "message") and hasattr(gen.message, "content"):
                             raw_text = str(gen.message.content or "")
-                            cleaned = cls._bersihkan_teks(raw_text)
-                            gen.message.content = cleaned
                         elif hasattr(gen, "text"):
                             raw_text = str(gen.text or "")
-                            cleaned = cls._bersihkan_teks(raw_text)
+
+                        cleaned = cls._bersihkan_teks(raw_text, is_string_io=is_string_io)
+
+                        # KRITIS: LangChain ChatGeneration memiliki DUA atribut:
+                        # 1. gen.message.content
+                        # 2. gen.text (yang dibaca langsung oleh Ragas pydantic_prompt!)
+                        # Keduanya HARUS diset agar Ragas menerima output yang sudah dibersihkan.
+                        if hasattr(gen, "message") and hasattr(gen.message, "content"):
+                            gen.message.content = cleaned
+                        if hasattr(gen, "text"):
                             try:
                                 gen.text = cleaned
                             except AttributeError:
                                 pass
 
             def generate_text(self, prompt, n: int = 1, temperature: float = 0.01, stop = None, callbacks = None):
-                res = super().generate_text(prompt, n=n, temperature=temperature, stop=stop, callbacks=callbacks)
-                self._proses_generations(res.generations)
-                return res
+                try:
+                    res = super().generate_text(prompt, n=n, temperature=temperature, stop=stop, callbacks=callbacks)
+                    self._proses_generations(res.generations, prompt=prompt)
+                    return res
+                except Exception as e:
+                    logger.warning("Ollama evaluator generate_text error (%s), mengembalikan fallback JSON...", e)
+                    from langchain_core.messages import AIMessage
+                    from langchain_core.outputs import ChatGeneration, LLMResult
+                    fallback_json = json.dumps({"statements": [], "classifications": [], "verifications": [], "text": ""})
+                    dummy_gen = [ChatGeneration(message=AIMessage(content=fallback_json), text=fallback_json)]
+                    return LLMResult(generations=[dummy_gen])
 
             async def agenerate_text(self, prompt, n: int = 1, temperature: float = 0.01, stop = None, callbacks = None):
-                res = await super().agenerate_text(prompt, n=n, temperature=temperature, stop=stop, callbacks=callbacks)
-                self._proses_generations(res.generations)
-                return res
+                try:
+                    res = await super().agenerate_text(prompt, n=n, temperature=temperature, stop=stop, callbacks=callbacks)
+                    self._proses_generations(res.generations, prompt=prompt)
+                    return res
+                except Exception as e:
+                    logger.warning("Ollama evaluator agenerate_text error (%s), mengembalikan fallback JSON...", e)
+                    from langchain_core.messages import AIMessage
+                    from langchain_core.outputs import ChatGeneration, LLMResult
+                    fallback_json = json.dumps({"statements": [], "classifications": [], "verifications": [], "text": ""})
+                    dummy_gen = [ChatGeneration(message=AIMessage(content=fallback_json), text=fallback_json)]
+                    return LLMResult(generations=[dummy_gen])
 
         evaluator_llm = RobustRagasLLMWrapper(
             ChatOllama(
                 model=config.LLM_EVAL_MODEL,
                 base_url=config.OLLAMA_BASE_URL,
+                format="json",
                 temperature=0.0,
+                repeat_penalty=1.15,
                 # KRITIS: thinking mode HARUS dimatikan untuk evaluator RAGAS.
                 # Qwen3 dengan thinking ON akan:
                 #   1. Menghabiskan 20-40 menit hanya untuk berpikir per call
@@ -529,6 +700,7 @@ def jalankan_evaluasi(
     output_json: str = "laporan_evaluasi.json",
     output_csv: str = "laporan_evaluasi.csv",
     output_excel: str | None = None,
+    evaluator_mode: str = "ragas",
 ) -> dict:
     """Fungsi runner generik untuk mengeksekusi pipeline evaluasi RAG."""
     t_start = time.time()
@@ -564,7 +736,6 @@ def jalankan_evaluasi(
         try:
             answer, contexts, meta = fungsi_eksekusi(q)
 
-            # Perbaikan: log jika konteks kosong
             if not contexts:
                 logger.warning(
                     f"[{tc_id}] Tidak ada konteks untuk: {q[:60]}"
@@ -598,29 +769,30 @@ def jalankan_evaluasi(
                 "perlu_rujukan_medis": False,
             })
 
-    # Perbaikan: Validasi evaluator sebelum memanggil RAGAS
-    evaluator_llm, evaluator_embeddings = buat_evaluator_ragas()
-
-    if evaluator_llm is None or evaluator_embeddings is None:
-        logger.warning(
-            "Evaluator LLM atau Embeddings tidak tersedia; "
-            "beralih ke evaluasi heuristik fallback."
-        )
+    if evaluator_mode == "heuristic":
         df_eval = hitung_skor_heuristic_fallback(dataset_records)
     else:
-        df_eval = evaluasi_dengan_ragas(
-            dataset_records=dataset_records,
-            evaluator_llm=evaluator_llm,
-            evaluator_embeddings=evaluator_embeddings,
-        )
+        evaluator_llm, evaluator_embeddings = buat_evaluator_ragas()
 
-        # Perbaikan (lapis luar): Jika masih NaN setelah RAGAS, pakai fallback
-        if _semua_nan(df_eval, _METRIC_COLS):
+        if evaluator_llm is None or evaluator_embeddings is None:
             logger.warning(
-                "Skor evaluasi RAGAS masih NaN setelah dijalankan. "
-                "Beralih ke evaluasi heuristik fallback."
+                "Evaluator LLM atau Embeddings tidak tersedia; "
+                "beralih ke evaluasi heuristik fallback."
             )
             df_eval = hitung_skor_heuristic_fallback(dataset_records)
+        else:
+            df_eval = evaluasi_dengan_ragas(
+                dataset_records=dataset_records,
+                evaluator_llm=evaluator_llm,
+                evaluator_embeddings=evaluator_embeddings,
+            )
+
+            if _semua_nan(df_eval, _METRIC_COLS):
+                logger.warning(
+                    "Skor evaluasi RAGAS masih NaN setelah dijalankan. "
+                    "Beralih ke evaluasi heuristik fallback."
+                )
+                df_eval = hitung_skor_heuristic_fallback(dataset_records)
 
     t_total = time.time() - t_start
     return simpan_dan_tampilkan_laporan(

@@ -14,6 +14,20 @@ import os
 import signal
 import sys
 from pathlib import Path
+
+# Memastikan root folder basic/ ada di sys.path agar impor 'from src import config' selalu berhasil
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+# Fallback: jika dijalankan via python global (misal base Anaconda), muat paket dari venv
+for _sp in [
+    ROOT_DIR / "venv" / "Lib" / "site-packages",
+    ROOT_DIR.parent / "venv" / "Lib" / "site-packages",
+]:
+    if _sp.is_dir() and str(_sp) not in sys.path:
+        sys.path.append(str(_sp))
+
 import pandas as pd
 from langchain_core.documents import Document
 from langchain_ollama import OllamaEmbeddings
@@ -32,14 +46,59 @@ _stop_requested = False
 
 def _resolusi_path(rel_path: str | Path) -> Path:
     p = Path(rel_path)
-    if p.exists():
-        return p
-    p_parent = Path("..") / rel_path
-    if p_parent.exists():
-        return p_parent
-    return p
+    candidates = [
+        p,
+        ROOT_DIR / rel_path,
+        ROOT_DIR.parent / rel_path,
+        Path("C:/Dokumen/riset/project/data") / p.name,
+        Path("C:/Dokumen/riset/project") / p.name,
+        ROOT_DIR.parent.parent / "project" / "data" / p.name,
+        ROOT_DIR.parent.parent / "project" / p.name,
+    ]
+    for cand in candidates:
+        if cand.exists():
+            return cand.resolve()
+    return (ROOT_DIR / rel_path).resolve()
 
 
+def _cari_dataset_csv(custom_path: str | None = None) -> Path:
+    """Mencari file CSV dataset artikel kesehatan dengan prioritas."""
+    if custom_path:
+        p = Path(custom_path)
+        if p.exists():
+            return p.resolve()
+        if (ROOT_DIR / custom_path).exists():
+            return (ROOT_DIR / custom_path).resolve()
+        raise FileNotFoundError(f"File dataset CSV yang diminta tidak ditemukan: '{custom_path}'")
+
+    nama_file_kandidat = [
+        "artikel_kesehatan_klikdokter.csv",
+        "artikel kesehatan klikdokter.csv",
+        "artikel_kesehatan.csv",
+        "artikel kesehatan.csv",
+        "klikdokter_test.csv",
+    ]
+    folder_kandidat = [
+        ROOT_DIR / "data",
+        Path("data"),
+        ROOT_DIR.parent / "data",
+        Path("C:/Dokumen/riset/project/data"),
+        Path("C:/Dokumen/riset/project"),
+        ROOT_DIR.parent.parent / "project" / "data",
+        ROOT_DIR.parent.parent / "project",
+    ]
+
+    for folder in folder_kandidat:
+        for nama in nama_file_kandidat:
+            target = folder / nama
+            if target.is_file():
+                return target.resolve()
+
+    return (ROOT_DIR / "data" / "artikel_kesehatan_klikdokter.csv").resolve()
+
+
+# Pastikan folder data/ ada
+(ROOT_DIR / "data").mkdir(parents=True, exist_ok=True)
 CHECKPOINT_PATH = _resolusi_path("data/checkpoint.json")
 BATCH_SIZE = 100
 
@@ -77,7 +136,14 @@ def muat_dokumen(csv_path: str | Path) -> list[Document]:
     Returns:
         List Document LangChain dengan metadata lengkap.
     """
-    df = pd.read_csv(csv_path)
+    p = Path(csv_path)
+    if not p.is_file():
+        raise FileNotFoundError(
+            f"File CSV artikel kesehatan tidak ditemukan di '{csv_path}'. "
+            "Pastikan file artikel_kesehatan.csv ada di folder 'data/' atau path yang valid."
+        )
+    logger.info("Membaca file dataset: %s", p)
+    df = pd.read_csv(p)
     df = df.dropna(subset=["konten"])
 
     dokumen: list[Document] = []
@@ -355,9 +421,17 @@ def main() -> None:
         CHECKPOINT_PATH.unlink()
         logger.info("Checkpoint direset. Ingestion akan dimulai dari awal.")
 
+    # Parse opsi opsional --file <path> jika user menentukan file khusus
+    custom_file = None
+    for i, arg in enumerate(sys.argv):
+        if arg in ("--file", "-f", "--data") and i + 1 < len(sys.argv):
+            custom_file = sys.argv[i + 1]
+            break
+
     # Tahap 1: Muat dokumen
     logger.info("[1/3] Memuat dokumen dari CSV...")
-    csv_file = _resolusi_path("data/artikel_kesehatan.csv")
+    csv_file = _cari_dataset_csv(custom_file)
+    logger.info("      File dataset: %s", csv_file)
     dokumen = muat_dokumen(csv_file)
     logger.info("      Total artikel: %d", len(dokumen))
 

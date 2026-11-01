@@ -54,7 +54,7 @@ basic/
     └── evaluasi_basic.py    # Script evaluasi RAGAS mandiri untuk Basic RAG
 ```
 
-> **Catatan Data:** Dataset artikel mentah (`data/artikel_kesehatan.csv`) dan database lokal tersimpan di folder root utama project (`../data/` dan `../qdrant_storage/`), sehingga file berukuran besar tidak diduplikasi.
+> **Catatan Data:** Dataset artikel kesehatan tersimpan di folder `basic/data/artikel_kesehatan_klikdokter.csv` (atau `artikel_kesehatan.csv`), dan database vektor lokal tersimpan di `basic/qdrant_storage/`.
 
 ---
 
@@ -94,6 +94,9 @@ python src/ingest.py
 
 # Atau jika ingin mereset koleksi dari awal:
 python src/ingest.py --reset
+
+# Atau jika ingin menggunakan file dataset CSV tertentu:
+python src/ingest.py --file data/artikel_kesehatan_klikdokter.csv
 ```
 
 ### 2. Menjalankan UI Chat (Streamlit)

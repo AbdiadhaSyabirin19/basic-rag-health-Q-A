@@ -13,6 +13,9 @@ Penggunaan CLI:
     # Evaluasi semua kategori (smoke test 3 sampel)
     python evaluasi/evaluasi_basic.py --limit 3
 
+    # Evaluasi tanpa menggunakan cache jawaban lama (generate ulang dari pipeline)
+    python evaluasi/evaluasi_basic.py --fresh --limit 5
+
     # Evaluasi kategori tertentu
     python evaluasi/evaluasi_basic.py --category happy-path
 
@@ -75,7 +78,6 @@ def muat_test_case(
     """Memuat kasus uji dari file JSON (format flat atau hierarkis Test Case 2)."""
     path = Path(file_path)
     if not path.is_absolute():
-        # Coba resolve relatif terhadap root project (satu level di atas basic/)
         project_root = ROOT_DIR.parent
         candidates = [
             ROOT_DIR / file_path,
@@ -95,7 +97,6 @@ def muat_test_case(
 
     # Deteksi format hierarkis (Test Case 2) vs flat (Test Case 1)
     if "test_cases" in data and isinstance(data["test_cases"], dict):
-        # Format hierarkis Test Case 2
         meta = {
             "dataset_name": data.get("dataset_name", "Test Case Evaluasi"),
             "language": data.get("language", "id"),
@@ -111,7 +112,6 @@ def muat_test_case(
                 tc["ground_truth"] = tc.get("expected_answer", tc.get("ground_truth", ""))
                 daftar_kasus.append(tc)
     else:
-        # Format flat Test Case 1 (list of dicts)
         meta = {"dataset_name": "Test Case 1"}
         items = data if isinstance(data, list) else data.get("test_cases", [])
         daftar_kasus = []
@@ -135,18 +135,16 @@ def muat_test_case(
 
 def buat_eksekutor_basic() -> Callable[[str], tuple[str, list[str], dict]]:
     """Menyiapkan runner eksekusi Basic RAG."""
-    from src.basic_rag.rag_chain import dapatkan_dokumen_relevan, tanya as tanya_basic
+    from src.basic_rag.rag_chain import tanya as tanya_basic
 
     def eksekusi_basic_rag(pertanyaan: str) -> tuple[str, list[str], dict]:
         t0 = time.time()
         hasil = tanya_basic(pertanyaan)
         durasi = time.time() - t0
 
-        dokumen_relevan = dapatkan_dokumen_relevan(pertanyaan)
         konteks = (
-            [doc.page_content for doc in dokumen_relevan]
-            if dokumen_relevan
-            else ["Tidak ada konteks ditemukan."]
+            getattr(hasil, "konteks", None)
+            or ["Tidak ada konteks ditemukan."]
         )
 
         meta_info = {
@@ -256,6 +254,7 @@ def jalankan_evaluasi_basic(
     limit: Optional[int] = None,
     evaluator_mode: str = "ragas",
     output_dir: str = "hasil evaluasi/basic",
+    no_cache: bool = False,
 ) -> dict:
     """Menjalankan evaluasi lengkap Basic RAG."""
     t_start = time.time()
@@ -267,6 +266,8 @@ def jalankan_evaluasi_basic(
     print(f"🔍 Kategori  : {kategori_filter or 'Semua'}")
     if limit:
         print(f"⚡ Limit     : {limit} soal")
+    if no_cache:
+        print("🔄 Mode Fresh: Cache jawaban lama diabaikan, pipeline RAG dieksekusi ulang.")
     print("=" * 80)
 
     meta_dataset, daftar_kasus = muat_test_case(test_case_file, kategori_filter)
@@ -283,6 +284,30 @@ def jalankan_evaluasi_basic(
     eksekutor = buat_eksekutor_basic()
     dataset_records = []
 
+    # File checkpoint agar progres tidak hilang jika macet/interupsi
+    ckpt_file = _log_dir / f"checkpoint_qa_{(kategori_filter or 'all').replace('-', '_')}.jsonl"
+    cached_records = {}
+
+    if no_cache and ckpt_file.exists():
+        try:
+            ckpt_file.unlink()
+            print("🔄 Checkpoint QA lama berhasil dibersihkan untuk pengujian ulang.")
+        except Exception as e_del:
+            logger.warning("Gagal menghapus checkpoint lama: %s", e_del)
+
+    if not no_cache and ckpt_file.exists():
+        try:
+            with open(ckpt_file, "r", encoding="utf-8") as f_ck:
+                for line in f_ck:
+                    if line.strip():
+                        r = json.loads(line)
+                        if "id" in r and not str(r.get("answer", "")).startswith("Error:"):
+                            cached_records[r["id"]] = r
+            if cached_records:
+                print(f"🔄 Menemukan checkpoint: {len(cached_records)} soal telah terjawab sebelumnya.")
+        except Exception as e_ck:
+            logger.warning("Gagal membaca checkpoint: %s", e_ck)
+
     for idx, tc in enumerate(daftar_kasus, 1):
         tc_id = tc.get("id", f"TC-{idx:03d}")
         q = tc.get("question", "")
@@ -295,11 +320,17 @@ def jalankan_evaluasi_basic(
         print(f"[{idx}/{total_kasus}] [{tc_id}] [{kat}] \"{q[:60]}...\"")
 
         try:
+            if not no_cache and tc_id in cached_records:
+                record = cached_records[tc_id]
+                dataset_records.append(record)
+                print(f"   ⚡ [Resume] Menggunakan cache ({record.get('durasi_detik', 0)}s | {len(record.get('contexts', []))} konteks)")
+                continue
+
             answer, contexts, meta = eksekutor(q)
             if not contexts:
                 contexts = ["Tidak ada konteks ditemukan."]
 
-            dataset_records.append({
+            rec = {
                 "id":                  tc_id,
                 "category":            kat,
                 "type":                tc.get("type", "happy_path"),
@@ -309,7 +340,13 @@ def jalankan_evaluasi_basic(
                 "ground_truth":        gt,
                 "durasi_detik":        meta.get("durasi_detik", 0),
                 "perlu_rujukan_medis": meta.get("perlu_rujukan_medis", False),
-            })
+            }
+            dataset_records.append(rec)
+
+            # Simpan langsung ke checkpoint agar jika terinterupsi, jawaban tidak hilang
+            with open(ckpt_file, "a", encoding="utf-8") as f_ck:
+                f_ck.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
             print(f"   ✓ Selesai ({meta.get('durasi_detik')}s | {len(contexts)} konteks)")
 
         except Exception as err:
@@ -361,7 +398,7 @@ def jalankan_evaluasi_basic(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. CLI Entry Point
+# 5. CLI Entrypoint
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
@@ -396,6 +433,12 @@ def main():
         help="Shortcut --evaluator heuristic (tanpa LLM RAGAS)",
     )
     parser.add_argument(
+        "--fresh", "--no-cache",
+        dest="no_cache",
+        action="store_true",
+        help="Abaikan cache jawaban lama dan jalankan ulang generasi jawaban dari pipeline RAG",
+    )
+    parser.add_argument(
         "--output-dir",
         default=str(ROOT_DIR / "hasil evaluasi" / "basic"),
         help="Direktori output laporan evaluasi",
@@ -410,6 +453,7 @@ def main():
         limit=args.limit,
         evaluator_mode=eval_mode,
         output_dir=args.output_dir,
+        no_cache=args.no_cache,
     )
 
 

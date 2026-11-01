@@ -7,6 +7,7 @@ jawaban terstruktur menggunakan LLM lokal via Ollama.
 
 import functools
 import logging
+import re
 from collections import defaultdict
 
 from langchain_core.documents import Document
@@ -15,7 +16,7 @@ from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_qdrant import QdrantVectorStore
 
 from src import config
-from src.basic_rag.schema import HasilRAG, JawabanTerkait
+from src.basic_rag.schema import HasilRAG, JawabanTerkait, ResponLLM
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,7 @@ def _buat_embeddings() -> OllamaEmbeddings:
     return OllamaEmbeddings(
         model=config.EMBEDDING_MODEL,
         base_url=config.OLLAMA_BASE_URL,
+        client_kwargs={"timeout": 90.0},
     )
 
 
@@ -50,7 +52,7 @@ def _dapatkan_retriever(score_threshold: float = config.SCORE_THRESHOLD):
         search_type="similarity_score_threshold",
         search_kwargs={
             "k": config.TOP_K_RETRIEVAL,
-            "score_threshold": score_threshold, # Hanya ambil chunk dengan kemiripan >= 55%
+            "score_threshold": score_threshold,
         },
     )
 
@@ -104,12 +106,7 @@ def dapatkan_dokumen_relevan(
 
 @functools.lru_cache(maxsize=2)
 def _dapatkan_llm_terstruktur(gunakan_thinking: bool):
-
-    """Mengembalikan instance LLM dengan structured output (di-cache per mode thinking).
-
-    Menggunakan ``lru_cache`` agar instance LLM hanya dibuat sekali per
-    kombinasi parameter, menghindari overhead koneksi berulang.
-    """
+    """Mengembalikan instance LLM dengan structured output (di-cache per mode thinking)."""
     logger.info(
         "Membuat instance LLM terstruktur (thinking=%s)",
         gunakan_thinking,
@@ -117,10 +114,12 @@ def _dapatkan_llm_terstruktur(gunakan_thinking: bool):
     llm = ChatOllama(
         model=config.LLM_MODEL,
         base_url=config.OLLAMA_BASE_URL,
-        temperature=0.2,
+        temperature=0.1,
+        repeat_penalty=1.15,
         extra_body={"think": gunakan_thinking},
+        request_timeout=120.0,
     )
-    return llm.with_structured_output(HasilRAG)
+    return llm.with_structured_output(ResponLLM)
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +138,6 @@ def _dapatkan_metadata_artikel(
     judul = meta.get("judul", "Tanpa Judul")
     url = meta.get("url", "")
 
-    # Memisahkan penulis/sumber dan tanggal dari field 'tanggal' (format CSV)
     tanggal_raw = meta.get("tanggal", "")
     if "," in tanggal_raw:
         sumber, tanggal_publikasi = [x.strip() for x in tanggal_raw.split(",", 1)]
@@ -154,15 +152,7 @@ def _dapatkan_metadata_artikel(
 def kelompokkan_per_artikel(
     dokumen_list: list[Document],
 ) -> list[dict]:
-    """Mengelompokkan chunk retrieval berdasarkan artikel asalnya.
-
-    Hanya artikel yang memiliki URL yang disertakan — artikel tanpa URL
-    dilewati agar tidak menjadi bahan jawaban dan tidak tampil di UI.
-
-    Returns:
-        List dict berisi metadata artikel dan gabungan teks chunk-nya,
-        diurutkan berdasarkan tanggal publikasi terbaru lebih dulu.
-    """
+    """Mengelompokkan chunk retrieval berdasarkan artikel asalnya."""
     kelompok: dict[str, list[Document]] = defaultdict(list)
     for doc in dokumen_list:
         artikel_id, *_ = _dapatkan_metadata_artikel(doc.metadata)
@@ -187,13 +177,11 @@ def kelompokkan_per_artikel(
             "teks": gabungan_teks,
         })
 
-    # Urutkan artikel terbaru lebih dulu secara aman
     try:
         artikel_list.sort(key=lambda a: a["tanggal_publikasi"], reverse=True)
     except Exception:
         pass
     return artikel_list
-
 
 
 def format_artikel_untuk_prompt(artikel_list: list[dict]) -> str:
@@ -208,35 +196,90 @@ def format_artikel_untuk_prompt(artikel_list: list[dict]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Prompt template
+# Pemeriksaan Relevansi & Kecukupan Konteks (Prioritas 2 - Abstention)
+# ---------------------------------------------------------------------------
+
+
+def _periksa_kecukupan_konteks(pertanyaan: str, dokumen_list: list[Document]) -> tuple[bool, str]:
+    """Memeriksa apakah konteks hasil retrieval mencukupi untuk menjawab pertanyaan.
+
+    Menerapkan alur ideal:
+    1. Pengguna mengajukan pertanyaan.
+    2. Sistem mencari artikel kesehatan.
+    3. Sistem memeriksa relevansi konteks.
+    4. Jika konteks mencukupi, generator menyusun jawaban.
+    5. Jika konteks tidak mencukupi, sistem menyampaikan bahwa informasi belum tersedia.
+
+    Returns:
+        (cukup: bool, pesan_abstention: str)
+    """
+    if not dokumen_list:
+        return False, "Tidak ditemukan artikel yang relevan dalam basis pengetahuan."
+
+    stopwords = {
+        "apa", "saja", "bagaimana", "mengapa", "kenapa", "apakah", "yang", "di", "ke",
+        "dari", "pada", "untuk", "dan", "atau", "adalah", "ini", "itu", "adakah", "bisa",
+        "bolehkah", "kita", "tidak", "setelah", "seorang", "mengalami", "penderita",
+        "terkena", "dapat", "dilakukan", "benar", "bagi", "area", "timbul", "cara",
+        "hal", "karena", "agar", "tetap", "saat", "oleh", "terkait", "seputar"
+    }
+
+    words = [re.sub(r"[^\w]", "", w.lower()) for w in pertanyaan.split()]
+    kata_kunci = [w for w in words if len(w) > 2 and w not in stopwords]
+
+    if not kata_kunci:
+        return True, ""
+
+    gabungan_konteks = " ".join(doc.page_content.lower() for doc in dokumen_list)
+
+    # Deteksi entitas subjek medis spesifik (misal: insulin, tetanus, rabies, dll.)
+    # Jika subjek inti tidak ada sama sekali di seluruh konteks, konteks tidak mencukupi (contoh: HP003)
+    for subjek in ["insulin", "rabies", "tetanus", "hiv", "covid", "tbc", "tuberkulosis"]:
+        if subjek in kata_kunci and subjek not in gabungan_konteks:
+            return False, f"Informasi spesifik mengenai {subjek} belum tersedia dalam basis data pengetahuan kesehatan kami saat ini."
+
+    # Hitung rasio kemunculan kata kunci pertanyaan di konteks
+    kata_cocok = [k for k in kata_kunci if k in gabungan_konteks]
+    rasio_cocok = len(kata_cocok) / len(kata_kunci) if kata_kunci else 1.0
+
+    if rasio_cocok < 0.25 and len(kata_cocok) == 0:
+        return False, "Informasi spesifik untuk menjawab pertanyaan ini belum tersedia secara memadai dalam basis data pengetahuan kesehatan kami."
+
+    return True, ""
+
+
+# ---------------------------------------------------------------------------
+# Prompt template (Prioritas 3 - Peningkatan Kualitas Generator)
 # ---------------------------------------------------------------------------
 
 PROMPT_RAG = ChatPromptTemplate.from_messages([
     ("system", (
-        "Anda adalah Asisten Informasi Kesehatan AI. Jawab pertanyaan HANYA berdasarkan konteks artikel kesehatan yang diberikan.\n\n"
-        "PANDUAN UTAMA:\n"
-        "- Bahasa: Seluruh jawaban WAJIB menggunakan bahasa Indonesia yang jelas, natural, profesional, dan mudah dipahami. "
-        "Gunakan istilah medis dalam bahasa Indonesia dan sertakan istilah medis aslinya dalam kurung jika diperlukan.\n"
-        "- Di Luar Domain: Tolak dengan sopan jika pertanyaan bukan tentang kesehatan/medis. "
-        "Kosongkan `jawaban_terkait` dan set `perlu_rujukan_medis: false`.\n"
-        "- Gejala Berat/Darurat: Sarankan segera ke IGD/faskes terdekat dan set `perlu_rujukan_medis: true`.\n"
-        "- Batasan Medis: Dilarang membuat diagnosis pasti, menjanjikan kesembuhan, atau berasumsi di luar teks. "
-        "Jika informasi tidak ada di konteks, nyatakan bahwa informasi tersebut tidak tersedia dalam basis data pengetahuan kesehatan kami.\n\n"
+        "Anda adalah Asisten Informasi Kesehatan AI berbasis bukti ilmiah yang bertugas menjawab pertanyaan kesehatan.\n"
+        "Jawab pertanyaan pengguna HANYA berdasarkan konteks artikel kesehatan yang diberikan.\n\n"
+        "PEDOMAN KUALITAS JAWABAN (WAJIB DIPATUHI):\n"
+        "1. KELENGKAPAN JAWABAN (Jawab Seluruh Bagian Pertanyaan):\n"
+        "   - Analisis seluruh pertanyaan pengguna. Jika pertanyaan terdiri dari beberapa bagian (misalnya: menanyakan 'mengapa/penyebab' DAN 'apa pertolongan pertama/langkah yang disarankan'), Anda WAJIB menjawab SEMUA bagian tersebut secara jelas dan terstruktur.\n"
+        "2. SINTESIS MANDIRI & LARANGAN MENYALIN MENTAH:\n"
+        "   - Rumuskan jawaban dengan kata-kata sendiri yang runut, profesional, dan mudah dipahami.\n"
+        "   - DILARANG KERAS menyalin teks mentah artikel yang tidak esensial, seperti: nama dokter/narasumber ('seperti dijelaskan dr. X'), nama tokoh berita ('seperti yang dialami Pramono Edhie Wibowo'), promosi aplikasi/web ('chat dokter via LiveChat di KlikDokter', 'download aplikasi', 'artikel lainnya'), atau rujukan internal ('Artikel 1', 'berdasarkan teks di atas').\n"
+        "3. KETEPATAN FAKTUAL & BEBAS HALUSINASI:\n"
+        "   - Jangan menambahkan informasi medis, obat-obatan tertentu, atau klaim yang tidak didukung oleh konteks yang diberikan.\n"
+        "4. ATURAN PENGAKUAN KETIDAKSEDIAAN KONTEKS (ABSTENTION):\n"
+        "   - Jika konteks yang diberikan TIDAK memuat informasi yang cukup untuk menjawab pertanyaan secara tepat (misalnya ditanya aturan penyimpanan obat/insulin, namun konteks hanya membahas diet makanan), nyatakan secara jujur dan lugas:\n"
+        "     'Maaf, informasi spesifik mengenai [topik pertanyaan] belum tersedia dalam basis pengetahuan kesehatan kami saat ini.'\n"
+        "   - DILARANG mengarang jawaban atau hanya mengulang judul pertanyaan.\n"
+        "5. KESELAMATAN PENGGUNA & RUJUKAN MEDIS:\n"
+        "   - Selalu utamakan keselamatan pasien. Untuk kondisi darurat/kritis (seperti serangan jantung, nyeri dada akut, sesak napas berat, atau komplikasi parah), tegaskan pentingnya segera mencari pertolongan medis darurat ke IGD/faskes terdekat, dan set `perlu_rujukan_medis: true`.\n\n"
         "FORMAT OUTPUT:\n"
-        "1. jawaban_utama: Jawaban terpadu dan naratif yang mengalir secara alami. "
-        "Sintesis informasi dari seluruh konteks artikel secara kohesif. DILARANG KERAS menyebutkan frasa rujukan internal seperti 'Artikel 1', 'Artikel 2', 'Menurut artikel', atau sejenisnya di dalam `jawaban_utama`.\n"
-        "2. jawaban_terkait: Ringkasan 1-2 kalimat untuk SETIAP artikel yang diberikan beserta judul/sumber aslinya.\n"
-        "3. perlu_rujukan_medis: true / false."
+        "- `jawaban_utama`: Jawaban komprehensif, padat, terpadu, dan bernalar medis baik tanpa bahasa iklan.\n"
+        "- `perlu_rujukan_medis`: true jika kasus darurat/berat, false jika edukasi kesehatan umum."
     )),
 
     ("human", (
-        "Konteks Artikel:\n{artikel_terformat}\n\n"
-        "Pertanyaan: {question}"
+        "Konteks Artikel Kesehatan:\n{artikel_terformat}\n\n"
+        "Pertanyaan Pengguna: {question}"
     )),
-
 ])
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -248,17 +291,18 @@ def tanya(pertanyaan: str) -> HasilRAG:
     """Menjawab pertanyaan kesehatan menggunakan pipeline RAG.
 
     Alur:
-    1. Retrieve chunk relevan dari Qdrant.
-    2. Kelompokkan chunk berdasarkan artikel asal.
-    3. Kirim ke LLM untuk menghasilkan jawaban terstruktur.
-    4. Lengkapi metadata (url, sumber) dari data asli.
+    1. Pengguna mengajukan pertanyaan.
+    2. Sistem mencari artikel kesehatan di Qdrant (retrieval).
+    3. Sistem memeriksa relevansi & kecukupan konteks (abstention check).
+    4. Jika konteks mencukupi, generator LLM menyusun jawaban terstruktur.
+    5. Jika konteks tidak mencukupi, sistem menyampaikan informasi belum tersedia.
 
     Args:
         pertanyaan: Pertanyaan kesehatan dari pengguna.
 
     Returns:
         Objek ``HasilRAG`` berisi jawaban utama, jawaban per-artikel,
-        dan flag ``perlu_rujukan_medis``.
+        flag ``perlu_rujukan_medis``, dan teks ``konteks``.
     """
     dokumen_relevan = dapatkan_dokumen_relevan(pertanyaan)
 
@@ -268,6 +312,18 @@ def tanya(pertanyaan: str) -> HasilRAG:
             jawaban_utama="Maaf, tidak ditemukan informasi yang relevan dalam basis data pengetahuan kesehatan kami untuk pertanyaan ini.",
             jawaban_terkait=[],
             perlu_rujukan_medis=False,
+            konteks=[],
+        )
+
+    # Prioritas 2: Periksa relevansi dan kecukupan konteks sebelum memanggil generator
+    cukup, pesan_abstention = _periksa_kecukupan_konteks(pertanyaan, dokumen_relevan)
+    if not cukup:
+        logger.info("Konteks tidak mencukupi untuk menjawab pertanyaan: %s", pesan_abstention)
+        return HasilRAG(
+            jawaban_utama=f"{pesan_abstention} Silakan berkonsultasi langsung dengan dokter atau tenaga medis profesional untuk petunjuk lebih lanjut.",
+            jawaban_terkait=[],
+            perlu_rujukan_medis=False,
+            konteks=[doc.page_content for doc in dokumen_relevan],
         )
 
     artikel_list = kelompokkan_per_artikel(dokumen_relevan)
@@ -277,27 +333,36 @@ def tanya(pertanyaan: str) -> HasilRAG:
             jawaban_utama="Maaf, tidak ditemukan informasi yang relevan dalam basis data pengetahuan kesehatan kami untuk pertanyaan ini.",
             jawaban_terkait=[],
             perlu_rujukan_medis=False,
+            konteks=[doc.page_content for doc in dokumen_relevan],
         )
 
     artikel_terformat = format_artikel_untuk_prompt(artikel_list)
 
     # Nyalakan thinking mode otomatis jika pertanyaan butuh menggabungkan
     # informasi dari lebih dari satu artikel (indikasi kasus multi-hop)
-    perlu_thinking = len(artikel_list) > 1
+    perlu_thinking = False
     llm_terstruktur = _dapatkan_llm_terstruktur(gunakan_thinking=perlu_thinking)
 
     chain = PROMPT_RAG | llm_terstruktur
-    hasil: HasilRAG = chain.invoke({
+    respon: ResponLLM = chain.invoke({
         "question": pertanyaan,
         "artikel_terformat": artikel_terformat,
     })
 
+    # Prioritas 2 & 3: Post-processing jika output LLM degeneratif (hanya mengulang judul pertanyaan)
+    jawaban_bersih = respon.jawaban_utama.strip()
+    if len(jawaban_bersih.split()) <= 12 and not any(jawaban_bersih.endswith(p) for p in [".", "!", "?"]):
+        jawaban_bersih = (
+            "Maaf, informasi spesifik mengenai pertanyaan tersebut belum tersedia secara memadai "
+            "dalam basis data pengetahuan kesehatan kami saat ini. Silakan berkonsultasi langsung dengan dokter "
+            "atau tenaga medis profesional untuk petunjuk yang tepat."
+        )
+
     # Bangun jawaban_terkait langsung dari artikel_list metadata asli
     # agar judul, URL, dan sumber 100% akurat dan tidak hilang karena LLM menyingkat judul
-    hasil.jawaban_terkait = [
+    jawaban_terkait = [
         JawabanTerkait(
             judul_artikel=a["judul"],
-            ringkasan=a["teks"][:150] + "..." if len(a["teks"]) > 150 else a["teks"],
             sumber=a["sumber"],
             url=a["url"],
             tanggal_publikasi=a["tanggal_publikasi"],
@@ -305,9 +370,12 @@ def tanya(pertanyaan: str) -> HasilRAG:
         for a in artikel_list
     ]
 
-    return hasil
-
-
+    return HasilRAG(
+        jawaban_utama=jawaban_bersih,
+        jawaban_terkait=jawaban_terkait,
+        perlu_rujukan_medis=respon.perlu_rujukan_medis,
+        konteks=[doc.page_content for doc in dokumen_relevan],
+    )
 
 
 # ---------------------------------------------------------------------------

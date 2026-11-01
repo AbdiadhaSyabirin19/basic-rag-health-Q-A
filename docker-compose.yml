@@ -21,9 +21,9 @@ services:
     environment:
       - QDRANT_HOST=qdrant
       - QDRANT_PORT=6333
-      - COLLECTION_NAME=artikel_kesehatan2
+      - COLLECTION_NAME=artikel_kesehatan
       - OLLAMA_BASE_URL=http://host.docker.internal:11434
-      - LLM_MODEL=qwen3:1.7b
+      - LLM_MODEL=qwen3-medis
       - EMBEDDING_MODEL=bge-m3
     extra_hosts:
       - "host.docker.internal:host-gateway"
