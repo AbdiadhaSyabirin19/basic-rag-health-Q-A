@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 st.set_page_config(
-    page_title="Tanya Kesehatan (RAG Lokal)",
+    page_title="Tanya Jawab Kesehatan (RAG)",
     page_icon="🩺",
     layout="wide",
 )
