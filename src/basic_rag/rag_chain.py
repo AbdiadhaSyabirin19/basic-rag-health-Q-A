@@ -11,6 +11,7 @@ import re
 from collections import defaultdict
 
 from langchain_core.documents import Document
+from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_qdrant import QdrantVectorStore
@@ -32,7 +33,7 @@ def _buat_embeddings() -> OllamaEmbeddings:
     return OllamaEmbeddings(
         model=config.EMBEDDING_MODEL,
         base_url=config.OLLAMA_BASE_URL,
-        client_kwargs={"timeout": 90.0},
+        client_kwargs={"timeout": 300.0},
     )
 
 
@@ -104,22 +105,39 @@ def dapatkan_dokumen_relevan(
         return retriever.invoke(pertanyaan)
 
 
-@functools.lru_cache(maxsize=2)
-def _dapatkan_llm_terstruktur(gunakan_thinking: bool):
-    """Mengembalikan instance LLM dengan structured output (di-cache per mode thinking)."""
-    logger.info(
-        "Membuat instance LLM terstruktur (thinking=%s)",
-        gunakan_thinking,
-    )
-    llm = ChatOllama(
+@functools.lru_cache(maxsize=1)
+def _dapatkan_llm():
+    """Mengembalikan instance LLM ChatOllama cepat dengan pembatasan token output agar tidak looping."""
+    logger.info("Menginisialisasi ChatOllama: model=%s", config.LLM_MODEL)
+    return ChatOllama(
         model=config.LLM_MODEL,
         base_url=config.OLLAMA_BASE_URL,
         temperature=0.1,
         repeat_penalty=1.15,
-        extra_body={"think": gunakan_thinking},
+        num_ctx=4096,      # kembalikan ke 4096 agar konteks retrieval cukup lega
+        num_predict=400,   # batasi max 400 token agar selesai dalam ~20-30 detik di CPU
+        stop=[
+            "<|im_end|>",
+            "<|endoftext|>",
+            "\n\n\n\n",
+            "Selamat mencoba!",
+            "KlikDokter.com -",
+        ],
         request_timeout=120.0,
     )
-    return llm.with_structured_output(ResponLLM)
+
+
+def _deteksi_perlu_rujukan_medis(teks_jawaban: str, pertanyaan: str) -> bool:
+    """Mendeteksi apakah pertanyaan/jawaban mengindikasikan kondisi darurat medis."""
+    teks_gabungan = f"{teks_jawaban} {pertanyaan}".lower()
+    kata_kunci_darurat = [
+        "igd", "gawat darurat", "segera ke dokter", "segera hubungi dokter",
+        "segera periksakan", "pertolongan medis darurat", "nyeri dada akut",
+        "serangan jantung", "stroke", "pendarahan hebat", "kehilangan kesadaran",
+        "sesak napas parah", "darurat medis", "kondisi kritis", "faskes terdekat",
+        "rumah sakit terdekat", "ambulans",
+    ]
+    return any(kata in teks_gabungan for kata in kata_kunci_darurat)
 
 
 # ---------------------------------------------------------------------------
@@ -255,24 +273,21 @@ def _periksa_kecukupan_konteks(pertanyaan: str, dokumen_list: list[Document]) ->
 PROMPT_RAG = ChatPromptTemplate.from_messages([
     ("system", (
         "Anda adalah Asisten Informasi Kesehatan AI berbasis bukti ilmiah yang bertugas menjawab pertanyaan kesehatan.\n"
-        "Jawab pertanyaan pengguna HANYA berdasarkan konteks artikel kesehatan yang diberikan.\n\n"
+        "Jawab pertanyaan pengguna berdasarkan fakta medis yang termuat dalam konteks artikel kesehatan yang diberikan.\n\n"
         "PEDOMAN KUALITAS JAWABAN (WAJIB DIPATUHI):\n"
-        "1. KELENGKAPAN JAWABAN (Jawab Seluruh Bagian Pertanyaan):\n"
-        "   - Analisis seluruh pertanyaan pengguna. Jika pertanyaan terdiri dari beberapa bagian (misalnya: menanyakan 'mengapa/penyebab' DAN 'apa pertolongan pertama/langkah yang disarankan'), Anda WAJIB menjawab SEMUA bagian tersebut secara jelas dan terstruktur.\n"
-        "2. SINTESIS MANDIRI & LARANGAN MENYALIN MENTAH:\n"
+        "1. SINTESIS MAKSIMAL KONTEKS:\n"
+        "   - Jelaskan informasi, penyebab, faktor risiko, maupun penanganan yang relevan sebagaimana diuraikan dalam artikel terlampir.\n"
+        "   - Jika artikel membahas penyebab atau pemicu secara spesifik (misalnya batu ginjal, penurunan fungsi organ, komplikasi penyakit kronis), jelaskan hal tersebut secara jelas dan terstruktur.\n"
+        "2. BAHASA NATURAL & PROFESIONAL:\n"
         "   - Rumuskan jawaban dengan kata-kata sendiri yang runut, profesional, dan mudah dipahami.\n"
-        "   - DILARANG KERAS menyalin teks mentah artikel yang tidak esensial, seperti: nama dokter/narasumber ('seperti dijelaskan dr. X'), nama tokoh berita ('seperti yang dialami Pramono Edhie Wibowo'), promosi aplikasi/web ('chat dokter via LiveChat di KlikDokter', 'download aplikasi', 'artikel lainnya'), atau rujukan internal ('Artikel 1', 'berdasarkan teks di atas').\n"
+        "   - DILARANG menyalin teks promosi aplikasi/web, nama dokter/tokoh berita, atau frasa rujukan seperti 'Artikel 1' dan 'berdasarkan teks di atas'.\n"
         "3. KETEPATAN FAKTUAL & BEBAS HALUSINASI:\n"
-        "   - Jangan menambahkan informasi medis, obat-obatan tertentu, atau klaim yang tidak didukung oleh konteks yang diberikan.\n"
+        "   - Jangan menambahkan resep obat keras atau klaim medis yang bertentangan dengan konteks.\n"
         "4. ATURAN PENGAKUAN KETIDAKSEDIAAN KONTEKS (ABSTENTION):\n"
-        "   - Jika konteks yang diberikan TIDAK memuat informasi yang cukup untuk menjawab pertanyaan secara tepat (misalnya ditanya aturan penyimpanan obat/insulin, namun konteks hanya membahas diet makanan), nyatakan secara jujur dan lugas:\n"
-        "     'Maaf, informasi spesifik mengenai [topik pertanyaan] belum tersedia dalam basis pengetahuan kesehatan kami saat ini.'\n"
-        "   - DILARANG mengarang jawaban atau hanya mengulang judul pertanyaan.\n"
-        "5. KESELAMATAN PENGGUNA & RUJUKAN MEDIS:\n"
-        "   - Selalu utamakan keselamatan pasien. Untuk kondisi darurat/kritis (seperti serangan jantung, nyeri dada akut, sesak napas berat, atau komplikasi parah), tegaskan pentingnya segera mencari pertolongan medis darurat ke IGD/faskes terdekat, dan set `perlu_rujukan_medis: true`.\n\n"
-        "FORMAT OUTPUT:\n"
-        "- `jawaban_utama`: Jawaban komprehensif, padat, terpadu, dan bernalar medis baik tanpa bahasa iklan.\n"
-        "- `perlu_rujukan_medis`: true jika kasus darurat/berat, false jika edukasi kesehatan umum."
+        "   - HANYA nyatakan informasi belum tersedia jika seluruh artikel yang diberikan benar-benar sama sekali tidak membahas topik penyakit/kondisi yang ditanyakan.\n"
+        "5. KESELAMATAN PENGGUNA:\n"
+        "   - Untuk kondisi darurat/kritis, ingatkan untuk mencari pertolongan medis ke IGD/faskes terdekat.\n\n"
+        "Berikan jawaban langsung berupa penjelasan medis yang informatif, padat, dan rapi dalam bahasa Indonesia."
     )),
 
     ("human", (
@@ -294,7 +309,7 @@ def tanya(pertanyaan: str) -> HasilRAG:
     1. Pengguna mengajukan pertanyaan.
     2. Sistem mencari artikel kesehatan di Qdrant (retrieval).
     3. Sistem memeriksa relevansi & kecukupan konteks (abstention check).
-    4. Jika konteks mencukupi, generator LLM menyusun jawaban terstruktur.
+    4. Jika konteks mencukupi, generator LLM menyusun jawaban informatif.
     5. Jika konteks tidak mencukupi, sistem menyampaikan informasi belum tersedia.
 
     Args:
@@ -338,28 +353,53 @@ def tanya(pertanyaan: str) -> HasilRAG:
 
     artikel_terformat = format_artikel_untuk_prompt(artikel_list)
 
-    # Nyalakan thinking mode otomatis jika pertanyaan butuh menggabungkan
-    # informasi dari lebih dari satu artikel (indikasi kasus multi-hop)
-    perlu_thinking = False
-    llm_terstruktur = _dapatkan_llm_terstruktur(gunakan_thinking=perlu_thinking)
+    # Eksekusi generator LLM langsung teks tanpa GBNF grammar JSON yang membuat CPU macet
+    llm = _dapatkan_llm()
+    chain = PROMPT_RAG | llm | StrOutputParser()
 
-    chain = PROMPT_RAG | llm_terstruktur
-    respon: ResponLLM = chain.invoke({
+    teks_mentah: str = chain.invoke({
         "question": pertanyaan,
         "artikel_terformat": artikel_terformat,
     })
+    logger.info("LLM teks mentah (panjang=%d): %r", len(teks_mentah), teks_mentah[:300])
 
-    # Prioritas 2 & 3: Post-processing jika output LLM degeneratif (hanya mengulang judul pertanyaan)
-    jawaban_bersih = respon.jawaban_utama.strip()
-    if len(jawaban_bersih.split()) <= 12 and not any(jawaban_bersih.endswith(p) for p in [".", "!", "?"]):
+    jawaban_bersih = teks_mentah.strip()
+
+    # Bersihkan jika LLM membalut jawaban dengan tag markdown atau format json yang tidak sengaja ter-generate
+    if jawaban_bersih.startswith("```json"):
+        jawaban_bersih = re.sub(r"^```json\s*", "", jawaban_bersih)
+        jawaban_bersih = re.sub(r"\s*```$", "", jawaban_bersih).strip()
+        try:
+            import json
+            data_json = json.loads(jawaban_bersih)
+            if isinstance(data_json, dict) and "jawaban_utama" in data_json:
+                jawaban_bersih = str(data_json["jawaban_utama"]).strip()
+        except Exception:
+            pass
+    elif jawaban_bersih.startswith("```"):
+        jawaban_bersih = re.sub(r"^```[a-zA-Z]*\s*", "", jawaban_bersih)
+        jawaban_bersih = re.sub(r"\s*```$", "", jawaban_bersih).strip()
+
+    # Post-processing jika output LLM kosong atau degeneratif terpotong di tengah kalimat
+    if not jawaban_bersih:
+        logger.warning("LLM mengembalikan output kosong. Mengambil intisari dari artikel terkait...")
+        cuplikan = [a.get("teks", "")[:250].strip() for a in artikel_list[:2] if a.get("teks")]
+        jawaban_bersih = (
+            "Berdasarkan artikel kesehatan terkait: " + " ".join(cuplikan)
+            if cuplikan else
+            "Informasi spesifik untuk menjawab pertanyaan ini belum tersedia secara memadai."
+        )
+    elif len(jawaban_bersih.split()) <= 6 and not any(jawaban_bersih.endswith(p) for p in [".", "!", "?"]):
         jawaban_bersih = (
             "Maaf, informasi spesifik mengenai pertanyaan tersebut belum tersedia secara memadai "
             "dalam basis data pengetahuan kesehatan kami saat ini. Silakan berkonsultasi langsung dengan dokter "
             "atau tenaga medis profesional untuk petunjuk yang tepat."
         )
 
+    # Deteksi status perlu rujukan medis
+    perlu_rujukan = _deteksi_perlu_rujukan_medis(jawaban_bersih, pertanyaan)
+
     # Bangun jawaban_terkait langsung dari artikel_list metadata asli
-    # agar judul, URL, dan sumber 100% akurat dan tidak hilang karena LLM menyingkat judul
     jawaban_terkait = [
         JawabanTerkait(
             judul_artikel=a["judul"],
@@ -373,7 +413,7 @@ def tanya(pertanyaan: str) -> HasilRAG:
     return HasilRAG(
         jawaban_utama=jawaban_bersih,
         jawaban_terkait=jawaban_terkait,
-        perlu_rujukan_medis=respon.perlu_rujukan_medis,
+        perlu_rujukan_medis=perlu_rujukan,
         konteks=[doc.page_content for doc in dokumen_relevan],
     )
 

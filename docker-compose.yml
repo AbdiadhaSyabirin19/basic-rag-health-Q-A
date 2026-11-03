@@ -11,6 +11,23 @@ services:
     networks:
       - rag_network
 
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama_kesehatan
+    ports:
+      - "11434:11434"   # Ollama REST API
+    volumes:
+      - ollama_data:/root/.ollama        # persist model agar tidak re-download tiap restart
+      - ./qwen3-medis.gguf:/models/qwen3-medis.gguf:ro   # mount file GGUF dari host (read-only)
+      - ./Modelfile:/models/Modelfile:ro                 # mount Modelfile dari host (read-only)
+    environment:
+      - OLLAMA_NUM_PARALLEL=1       # 1 request sekaligus di CPU
+      - OLLAMA_MAX_LOADED_MODELS=2  # muat bge-m3 (1.1GB) & qwen3-medis (1.8GB) bersamaan agar tidak swap bolak-balik
+      - OLLAMA_KEEP_ALIVE=24h       # tahan model di memori selama 24 jam agar tidak di-unload otomatis
+    restart: unless-stopped
+    networks:
+      - rag_network
+
   app:
     build:
       context: .
@@ -18,20 +35,28 @@ services:
     container_name: streamlit_kesehatan
     ports:
       - "8501:8501"   # Streamlit Web UI
+    volumes:
+      - ./src:/app/src   # Bind mount: kode live sinkron langsung tanpa rebuild
+      - ./ui:/app/ui     # Bind mount: UI live sinkron langsung
     environment:
       - QDRANT_HOST=qdrant
       - QDRANT_PORT=6333
       - COLLECTION_NAME=artikel_kesehatan
-      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - OLLAMA_BASE_URL=http://ollama:11434   # arahkan ke container ollama
       - LLM_MODEL=qwen3-medis
+      - LLM_EVAL_MODEL=qwen3:1.7b
       - EMBEDDING_MODEL=bge-m3
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - TOP_K_RETRIEVAL=4
+      - SCORE_THRESHOLD=0.55
     depends_on:
       - qdrant
+      - ollama
     restart: unless-stopped
     networks:
       - rag_network
+
+volumes:
+  ollama_data:   # named volume: model Ollama tersimpan permanen
 
 networks:
   rag_network:

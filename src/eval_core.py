@@ -357,6 +357,7 @@ def buat_evaluator_ragas():
             OllamaEmbeddings(
                 model=config.EMBEDDING_MODEL,
                 base_url=config.OLLAMA_BASE_URL,
+                client_kwargs={"timeout": 300.0},
             )
         )
         return evaluator_llm, evaluator_embeddings

@@ -58,25 +58,34 @@ basic/
 
 ---
 
-## ⚙️ Prasyarat Layanan
+## ⚙️ Menjalankan Sistem (Dua Metode)
 
-Sebelum menjalankan aplikasi, pastikan layanan berikut telah aktif:
+### Metode A: Menggunakan Docker Compose (Full Containerized - Recommended)
+Seluruh komponen (Qdrant, Ollama, dan Streamlit UI) berjalan otomatis di dalam Docker:
 
-1. **Docker Qdrant** (berjalan pada port `6333`):
+```powershell
+# Jalankan dari folder basic/
+cd basic
+docker compose up -d
+
+# Registrasi model qwen3-medis dan pull bge-m3 ke container Ollama (pertama kali saja):
+docker exec -it ollama_kesehatan ollama create qwen3-medis -f /models/Modelfile
+docker exec -it ollama_kesehatan ollama pull bge-m3
+```
+Aplikasi Streamlit langsung aktif di browser pada alamat `http://localhost:8501`.
+
+---
+
+### Metode B: Menjalankan Secara Manual (Host / Bare-Metal)
+
+1. **Docker Qdrant & Ollama** (port `6333` dan `11434`):
    ```powershell
-   # Dari root project
-   docker-compose up -d
+   cd basic
+   docker compose up -d qdrant ollama
    ```
-2. **Ollama** (berjalan pada port `11434`):
+2. **Python Virtual Environment** (aktifkan venv project):
    ```powershell
-   ollama serve
-   # Pastikan model sudah terunduh:
-   ollama pull bge-m3
-   ollama pull qwen3:1.7b
-   ```
-3. **Python Virtual Environment** (aktifkan venv project):
-   ```powershell
-   # Dari root project
+   cd basic
    .\venv\Scripts\Activate.ps1
    ```
 
