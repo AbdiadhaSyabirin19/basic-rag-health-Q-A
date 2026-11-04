@@ -72,7 +72,7 @@ docker compose up -d
 docker exec -it ollama_kesehatan ollama create qwen3-medis -f /models/Modelfile
 docker exec -it ollama_kesehatan ollama pull bge-m3
 ```
-Aplikasi Streamlit langsung aktif di browser pada alamat `http://localhost:8501`.
+Aplikasi Streamlit langsung aktif di browser pada alamat `http://localhost:8080`.
 
 ---
 
@@ -114,9 +114,9 @@ Membuka antarmuka chat tanya-jawab kesehatan:
 ```powershell
 # Jalankan dari folder basic/
 cd basic
-streamlit run ui/basic_rag_app.py
+streamlit run ui/basic_rag_app.py --server.port 8080
 ```
-Aplikasi akan terbuka otomatis di browser pada alamat `http://localhost:8501`.
+Aplikasi akan terbuka otomatis di browser pada alamat `http://localhost:8080`.
 
 ### 3. Menjalankan Evaluasi RAGAS
 

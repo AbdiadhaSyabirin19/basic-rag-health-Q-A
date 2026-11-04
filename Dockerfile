@@ -19,8 +19,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY src/ ./src/
 COPY ui/ ./ui/
 
-EXPOSE 8501
+EXPOSE 8080
 
-HEALTHCHECK CMD curl --fail http://localhost:8501/_stcore/health || exit 1
+HEALTHCHECK CMD curl --fail http://localhost:8080/_stcore/health || exit 1
 
-ENTRYPOINT ["streamlit", "run", "ui/basic_rag_app.py", "--server.port=8501", "--server.address=0.0.0.0", "--server.headless=true", "--browser.gatherUsageStats=false"]
+ENTRYPOINT ["streamlit", "run", "ui/basic_rag_app.py", "--server.port=8080", "--server.address=0.0.0.0", "--server.headless=true", "--browser.gatherUsageStats=false"]
